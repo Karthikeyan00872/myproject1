@@ -1,0 +1,23 @@
+git config --global user.name "Your Name": Sets your global username for Git commits.
+git config --global user.email "your_email@example.com": Sets your global email address for Git commits.
+
+PS D:\karthi\git> git clone https://github.com/Karthikeyan00872/myproject.git
+PS D:\karthi\git> cd myproject
+PS D:\karthi\git\myproject> git status
+PS D:\karthi\git\myproject> git add index.css
+PS D:\karthi\git\myproject> git push origin main
+PS D:\karthi\git\myproject> git pull
+
+#create new repository
+PS D:\karthi\git\myproject1> git add .
+PS D:\karthi\git\myproject1> git commit -m "create a new repostery"
+PS D:\karthi\git\myproject1> git branch -M main
+PS D:\karthi\git\myproject1> git remote add origin https://github.com/Karthikeyan00872/myproject1.git
+PS D:\karthi\git\myproject1> git push origin main 
+
+#create new branch
+PS D:\karthi\git\myproject1> git pull
+PS D:\karthi\git\myproject1> git checkout newbranch
+PS D:\karthi\git\myproject1> git add .
+PS D:\karthi\git\myproject1> git commit -m "create a new repostery"
+PS D:\karthi\git\myproject1> git push origin newbranch
