@@ -1,5 +1,5 @@
 # backend/app.py
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from pymongo import MongoClient
 from bson.objectid import ObjectId
@@ -271,7 +271,17 @@ def send_password_reset_email(to_email, reset_link):
 # Routes
 @app.route('/')
 def home():
-    return jsonify({'message': 'Question Generator API with Gemini AI is running!'})
+    return send_from_directory(app.root_path, 'index.html')
+
+
+@app.route('/style.css')
+def serve_styles():
+    return send_from_directory(app.root_path, 'style.css')
+
+
+@app.route('/app.js')
+def serve_script():
+    return send_from_directory(app.root_path, 'app.js')
 
 # Generate Question Paper with AI
 @app.route('/api/generate-paper', methods=['POST'])
