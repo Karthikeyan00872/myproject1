@@ -14,8 +14,6 @@ import os
 from dotenv import load_dotenv
 import logging
 import google.generativeai as genai
-import tempfile
-import base64
 import io
 from PIL import Image
 import PyPDF2
