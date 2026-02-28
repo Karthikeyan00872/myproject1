@@ -8,6 +8,7 @@ import jwt
 import datetime
 from functools import wraps
 import json
+import re
 import smtplib
 from email.message import EmailMessage
 import os
@@ -41,37 +42,117 @@ def load_genai_module():
 app = Flask(__name__)
 CORS(app)
 
-# MongoDB Configuration
-MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017/')
-logger.info(f"Connecting to MongoDB: {MONGO_URI}")
+DB_BACKEND = 'mongodb'
 
-try:
-    client = MongoClient(MONGO_URI)
-    db = client['question_generator']
-    users_collection = db['login']
-    papers_collection = db['papers']
-    validations_collection = db['validations']
-    
-    # Test connection
-    client.admin.command('ping')
-    logger.info("✅ MongoDB connected successfully")
-    
-    # Count existing users
-    user_count = users_collection.count_documents({})
-    logger.info(f"📊 Total users in database: {user_count}")
-    
-except Exception as e:
-    logger.error(f"❌ MongoDB connection failed: {str(e)}")
-    raise
+
+class InsertOneResult:
+    def __init__(self, inserted_id):
+        self.inserted_id = inserted_id
+
+
+class InMemoryCollection:
+    def __init__(self):
+        self._docs = []
+
+    def _matches(self, doc, query):
+        return all(doc.get(k) == v for k, v in query.items())
+
+    def find_one(self, query):
+        for doc in self._docs:
+            if self._matches(doc, query):
+                return dict(doc)
+        return None
+
+    def insert_one(self, document):
+        doc = dict(document)
+        doc.setdefault('_id', ObjectId())
+        self._docs.append(doc)
+        return InsertOneResult(doc['_id'])
+
+    def update_one(self, query, update):
+        for i, doc in enumerate(self._docs):
+            if not self._matches(doc, query):
+                continue
+            doc = dict(doc)
+            for key, val in update.get('$set', {}).items():
+                doc[key] = val
+            for key in update.get('$unset', {}).keys():
+                doc.pop(key, None)
+            self._docs[i] = doc
+            return
+
+    def count_documents(self, query):
+        return sum(1 for doc in self._docs if self._matches(doc, query))
+
+    def create_index(self, *_args, **_kwargs):
+        return None
+
+
+class InMemoryClient:
+    def __init__(self):
+        self.admin = self
+
+    def command(self, _cmd):
+        return {'ok': 1}
+
+    def server_info(self):
+        return {'version': 'in-memory'}
+
+
+def init_database():
+    """Initialize MongoDB and gracefully fallback to in-memory DB when needed."""
+    global DB_BACKEND
+
+    mongo_uri = os.getenv('MONGO_URI', 'mongodb://localhost:27017/')
+    fallback_enabled = os.getenv('MONGO_FALLBACK_TO_MOCK', 'true').lower() in {'1', 'true', 'yes'}
+    logger.info("Connecting to MongoDB: %s", mongo_uri)
+
+    try:
+        mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        mongo_client.admin.command('ping')
+        database = mongo_client['question_generator']
+        DB_BACKEND = 'mongodb'
+        logger.info("✅ MongoDB connected successfully")
+        return (
+            mongo_client,
+            database,
+            database['login'],
+            database['papers'],
+            database['validations'],
+        )
+    except Exception as exc:
+        if not fallback_enabled:
+            logger.error("❌ MongoDB connection failed and fallback is disabled: %s", str(exc))
+            raise
+
+        logger.warning("⚠️ MongoDB unavailable. Falling back to built-in in-memory storage: %s", str(exc))
+        mongo_client = InMemoryClient()
+        database = {
+            'login': InMemoryCollection(),
+            'papers': InMemoryCollection(),
+            'validations': InMemoryCollection(),
+        }
+        DB_BACKEND = 'in-memory'
+        return (
+            mongo_client,
+            database,
+            database['login'],
+            database['papers'],
+            database['validations'],
+        )
+
+
+client, db, users_collection, papers_collection, validations_collection = init_database()
 
 # Gemini AI Configuration
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 genai, GENAI_UNAVAILABLE_REASON = load_genai_module()
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
 
 if GEMINI_API_KEY:
     if genai:
         genai.configure(api_key=GEMINI_API_KEY)
-        logger.info("✅ Gemini AI configured successfully")
+        logger.info("✅ Gemini AI configured successfully with model: %s", GEMINI_MODEL)
     else:
         logger.warning("⚠️ Gemini AI disabled: %s", GENAI_UNAVAILABLE_REASON)
 else:
@@ -132,7 +213,7 @@ def generate_questions_with_gemini(subject, topics, difficulty, question_types, 
         if not genai:
             return None, GENAI_UNAVAILABLE_REASON
         
-        model = genai.GenerativeModel('gemini-pro')
+        model = genai.GenerativeModel(GEMINI_MODEL)
         
         prompt = f"""
         Generate a question paper for {subject} with the following specifications:
@@ -153,7 +234,7 @@ def generate_questions_with_gemini(subject, topics, difficulty, question_types, 
         """
         
         response = model.generate_content(prompt)
-        return response.text, None
+        return (response.text or '').strip(), None
         
     except Exception as e:
         logger.error(f"Gemini AI error: {str(e)}")
@@ -168,7 +249,7 @@ def validate_answer_with_gemini(question, answer, max_marks):
         if not genai:
             return None, None, GENAI_UNAVAILABLE_REASON
         
-        model = genai.GenerativeModel('gemini-pro')
+        model = genai.GenerativeModel(GEMINI_MODEL)
         
         prompt = f"""
         As an expert examiner, evaluate the following answer:
@@ -192,6 +273,30 @@ def validate_answer_with_gemini(question, answer, max_marks):
     except Exception as e:
         logger.error(f"Gemini AI validation error: {str(e)}")
         return None, str(e)
+
+
+def normalize_question_types(raw_question_types):
+    if isinstance(raw_question_types, list):
+        return [qt.strip() for qt in raw_question_types if str(qt).strip()]
+    if isinstance(raw_question_types, str):
+        return [qt.strip() for qt in raw_question_types.split(',') if qt.strip()]
+    return []
+
+
+def parse_request_payload():
+    """Normalize JSON and multipart/form-data requests."""
+    if request.is_json:
+        return request.get_json(silent=True) or {}
+
+    data = request.form.to_dict(flat=True)
+    if 'question_types' in request.form:
+        data['question_types'] = request.form.getlist('question_types')
+    if 'additional_info' in data and isinstance(data['additional_info'], str):
+        try:
+            data['additional_info'] = json.loads(data['additional_info'])
+        except json.JSONDecodeError:
+            data['additional_info'] = {'raw': data['additional_info']}
+    return data
 
 def extract_text_from_file(file_content, file_type):
     """Extract text from uploaded files for processing"""
@@ -288,20 +393,39 @@ def serve_script():
 @token_required
 def generate_paper(current_user):
     try:
-        data = request.get_json()
+        data = parse_request_payload()
         
         required_fields = ['title', 'subject', 'topics', 'difficulty', 'question_types', 'total_marks']
         for field in required_fields:
-            if field not in data:
+            if field not in data or data.get(field) in (None, ''):
                 return jsonify({'message': f'{field} is required'}), 400
+
+        question_types = normalize_question_types(data.get('question_types', []))
+        if not question_types:
+            return jsonify({'message': 'question_types must include at least one type'}), 400
+
+        total_marks = int(data.get('total_marks', 0))
+        if total_marks <= 0:
+            return jsonify({'message': 'total_marks must be a positive integer'}), 400
+
+        context_text = ''
+        context_file = request.files.get('context_file')
+        if context_file and context_file.filename:
+            context_text = extract_text_from_file(context_file.read(), context_file.mimetype)
+
+        additional_info = data.get('additional_info', {})
+        if not isinstance(additional_info, dict):
+            additional_info = {'raw': str(additional_info)}
+        if context_text:
+            additional_info['context_excerpt'] = context_text[:2500]
         
         # Generate questions using Gemini AI
         ai_content, error = generate_questions_with_gemini(
             data['subject'],
             data['topics'],
             data['difficulty'],
-            data['question_types'],
-            data['total_marks']
+            question_types,
+            total_marks
         )
         
         if error:
@@ -330,12 +454,12 @@ def generate_paper(current_user):
             'subject': data['subject'],
             'topics': data['topics'],
             'difficulty': data['difficulty'],
-            'question_types': data['question_types'],
-            'total_marks': data['total_marks'],
-            'ai_generated': bool(GEMINI_API_KEY),
+            'question_types': question_types,
+            'total_marks': total_marks,
+            'ai_generated': bool(GEMINI_API_KEY and not error),
             'content': ai_content,
             'created_at': datetime.datetime.utcnow(),
-            'additional_info': data.get('additional_info', {})
+            'additional_info': additional_info
         }
         
         result = papers_collection.insert_one(paper_data)
@@ -344,7 +468,9 @@ def generate_paper(current_user):
             'message': 'Question paper generated successfully',
             'paper_id': str(result.inserted_id),
             'content': ai_content,
-            'ai_used': bool(GEMINI_API_KEY)
+            'ai_used': bool(GEMINI_API_KEY and not error),
+            'used_context': bool(context_text),
+            'fallback_reason': error
         }), 201
         
     except Exception as e:
@@ -444,11 +570,14 @@ def validate_answers(current_user):
 @token_required
 def get_ai_sample_questions(current_user):
     try:
-        data = request.get_json()
-        
+        data = parse_request_payload()
+
         subject = data.get('subject', 'General')
         topic = data.get('topic', 'Introduction')
-        count = data.get('count', 5)
+        instructions = data.get('instructions', '')
+        difficulty = data.get('difficulty', 'mixed')
+        count = max(1, min(int(data.get('count', 5)), 20))
+        question_types = normalize_question_types(data.get('question_types', 'MCQ,Short Answer,Essay'))
         
         if not GEMINI_API_KEY:
             return jsonify({
@@ -459,25 +588,26 @@ def get_ai_sample_questions(current_user):
                 ]
             }), 200
         
-        model = genai.GenerativeModel('gemini-pro')
+        model = genai.GenerativeModel(GEMINI_MODEL)
         
         prompt = f"""
-        Generate {count} sample questions for {subject} on the topic of {topic}.
+        Generate exactly {count} high-quality questions for {subject} on the topic of {topic}.
         
         Include:
-        - Different question types (MCQ, short answer, essay)
-        - Varying difficulty levels
+        - Question types: {', '.join(question_types)}
+        - Difficulty focus: {difficulty}
         - Clear mark allocations
-        - Expected answers
+        - A brief expected answer for each
+        - Follow these user instructions strictly: {instructions or 'None'}
         
-        Format each question clearly.
+        Return plain text with one question block per item.
         """
         
         response = model.generate_content(prompt)
         
         return jsonify({
             'message': 'Sample questions generated successfully',
-            'questions': response.text.split('\n'),
+            'questions': [q.strip() for q in re.split(r'\n\s*\n', response.text or '') if q.strip()],
             'ai_generated': True
         }), 200
         
@@ -485,11 +615,66 @@ def get_ai_sample_questions(current_user):
         logger.error(f"Sample questions error: {str(e)}")
         return jsonify({'message': 'Server error occurred'}), 500
 
+
+@app.route('/api/generate-questions', methods=['POST'])
+@token_required
+def generate_dynamic_questions(current_user):
+    """Generate dynamic questions from topic-specific user instructions using Gemini."""
+    try:
+        data = parse_request_payload()
+        subject = data.get('subject', '').strip()
+        topics = data.get('topics', '').strip()
+        instructions = data.get('instructions', '').strip()
+        difficulty = data.get('difficulty', 'mixed').strip()
+        count = max(1, min(int(data.get('count', 5)), 25))
+        question_types = normalize_question_types(data.get('question_types', ['MCQ', 'Short Answer']))
+
+        if not subject or not topics:
+            return jsonify({'message': 'subject and topics are required'}), 400
+
+        if not GEMINI_API_KEY:
+            return jsonify({'message': 'Gemini API key not configured'}), 503
+
+        if not genai:
+            return jsonify({'message': GENAI_UNAVAILABLE_REASON}), 503
+
+        prompt = f"""
+        You are an assessment design expert.
+        Create exactly {count} questions for subject "{subject}" focused on: {topics}.
+        Required difficulty distribution: {difficulty}.
+        Required question styles: {', '.join(question_types)}.
+        User instructions that must be followed: {instructions or 'None'}.
+
+        Output as JSON array where each item includes:
+        - question
+        - type
+        - difficulty
+        - marks
+        - expected_answer
+        """
+
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        response = model.generate_content(prompt)
+
+        return jsonify({
+            'message': 'Dynamic questions generated successfully',
+            'subject': subject,
+            'topics': topics,
+            'questions': (response.text or '').strip(),
+            'model': GEMINI_MODEL,
+            'count': count,
+        }), 200
+    except Exception as e:
+        logger.error('Dynamic question generation error: %s', str(e))
+        return jsonify({'message': 'Server error occurred'}), 500
+
 # Check AI Status
 @app.route('/api/ai-status', methods=['GET'])
 def ai_status():
     return jsonify({
         'gemini_configured': bool(GEMINI_API_KEY),
+        'model': GEMINI_MODEL,
+        'unavailable_reason': GENAI_UNAVAILABLE_REASON,
         'ai_features': {
             'question_generation': bool(GEMINI_API_KEY),
             'answer_validation': bool(GEMINI_API_KEY),
@@ -566,7 +751,6 @@ def api_generate_material(current_user):
                 logger.warning('Gemini summarization failed: %s', str(e))
 
         # Fallback summarization
-        import re
         sentences = re.split(r'(?<=[\.\?\!])\s', (text or '').replace('\n', ' '))
         if summary_length == 'short':
             n = min(2, len(sentences))
@@ -836,8 +1020,23 @@ def get_profile(current_user):
 # Check Authentication Status
 @app.route('/api/check-auth', methods=['GET'])
 def check_auth():
-    # Placeholder for check auth
-    return jsonify({'authenticated': False}), 200
+    token = None
+    if 'Authorization' in request.headers:
+        auth_header = request.headers['Authorization']
+        if auth_header.startswith('Bearer '):
+            token = auth_header.split(' ')[1]
+
+    if not token:
+        return jsonify({'authenticated': False}), 200
+
+    try:
+        data = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user = users_collection.find_one({'_id': ObjectId(data['user_id'])})
+        if not user:
+            return jsonify({'authenticated': False}), 200
+        return jsonify({'authenticated': True, 'user_id': str(user['_id']), 'email': user.get('email')}), 200
+    except jwt.InvalidTokenError:
+        return jsonify({'authenticated': False}), 200
 
 # Database Status
 @app.route('/api/db-status', methods=['GET'])
@@ -853,7 +1052,7 @@ def db_status():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     # Basic health check endpoint
-    return jsonify({'status': 'ok', 'server': 'running'}), 200
+    return jsonify({'status': 'ok', 'server': 'running', 'db_backend': DB_BACKEND}), 200
 
 if __name__ == '__main__':
     # Create indexes

@@ -1,7 +1,7 @@
 // app.js - FIXED LOGIN AND REGISTRATION
 // (Replace the entire app.js content with this)
 
-const API_BASE_URL = 'http://localhost:5000/api';
+const API_BASE_URL = `${window.location.origin}/api`;
 const USE_MOCK_API = false; // Set to false when backend is running
 
 // State management
