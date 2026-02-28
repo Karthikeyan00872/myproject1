@@ -409,24 +409,41 @@ def parse_request_payload():
             data['additional_info'] = {'raw': data['additional_info']}
     return data
 
-def extract_text_from_file(file_content, file_type):
+def extract_text_from_file(file_content, file_type, filename=''):
     """Extract text from uploaded files for processing"""
     try:
-        if file_type == 'application/pdf':
+        normalized_type = (file_type or '').lower()
+        extension = os.path.splitext((filename or '').lower())[1]
+
+        is_pdf = normalized_type in {'application/pdf', 'application/x-pdf', 'application/acrobat'} or extension == '.pdf'
+        is_docx = normalized_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or extension == '.docx'
+        is_doc = normalized_type == 'application/msword' or extension == '.doc'
+        is_text = normalized_type.startswith('text/') or extension == '.txt'
+        is_image = normalized_type in {'image/jpeg', 'image/png', 'image/jpg'} or extension in {'.jpg', '.jpeg', '.png'}
+
+        if is_pdf:
             # Extract text from PDF
             pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_content))
             text = ""
             for page in pdf_reader.pages:
-                text += page.extract_text()
+                text += page.extract_text() or ''
             return text
             
-        elif file_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+        elif is_docx:
             # Extract text from DOCX
             doc = Document(io.BytesIO(file_content))
             text = "\n".join([para.text for para in doc.paragraphs])
             return text
+
+        elif is_doc:
+            # Legacy DOC extraction is not supported in this service.
+            return "Unsupported file format"
+
+        elif is_text:
+            # Extract text from TXT
+            return file_content.decode('utf-8', errors='ignore')
             
-        elif file_type in ['image/jpeg', 'image/png', 'image/jpg']:
+        elif is_image:
             # Extract text from image using Gemini Vision
             ready, reason = gemini_ready()
             if not ready:
@@ -519,9 +536,17 @@ def generate_paper(current_user):
             return jsonify({'message': 'total_marks must be a positive integer'}), 400
 
         context_text = ''
-        context_file = request.files.get('context_file')
+        context_file = (
+            request.files.get('context_file')
+            or request.files.get('source_file')
+            or request.files.get('source_upload')
+        )
         if context_file and context_file.filename:
-            context_text = extract_text_from_file(context_file.read(), context_file.mimetype)
+            context_text = extract_text_from_file(
+                context_file.read(),
+                context_file.mimetype,
+                context_file.filename,
+            )
 
         source_text_input = str(data.get('source_text', '')).strip()
         source_material = '\n\n'.join([chunk for chunk in [context_text, source_text_input] if chunk]).strip()
