@@ -39,6 +39,7 @@ Set at least:
 
 Gemini note:
 - If your configured `GEMINI_MODEL` is unavailable for your free-tier account, the backend automatically retries with compatible fallback models.
+- The backend uses the new SDK format: `from google import genai` with `genai.Client(api_key=...)`.
 
 Mongo options:
 - Use local MongoDB via `MONGO_URI`
