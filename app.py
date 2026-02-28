@@ -30,14 +30,11 @@ load_dotenv()
 
 
 def load_genai_module():
-    """Load google.generativeai only when runtime is supported."""
-    if sys.version_info >= (3, 14):
-        return None, "google-generativeai is currently incompatible with Python 3.14+. Use Python 3.13 or lower."
+    """Load google.genai client SDK."""
+    if importlib.util.find_spec('google.genai') is None:
+        return None, "google-genai package is not installed."
 
-    if importlib.util.find_spec('google.generativeai') is None:
-        return None, "google-generativeai package is not installed."
-
-    return importlib.import_module('google.generativeai'), None
+    return importlib.import_module('google.genai'), None
 
 app = Flask(__name__)
 CORS(app)
@@ -148,6 +145,7 @@ client, db, users_collection, papers_collection, validations_collection = init_d
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
 GEMINI_API_KEY_SOURCE = 'GEMINI_API_KEY' if os.getenv('GEMINI_API_KEY') else ('GOOGLE_API_KEY' if os.getenv('GOOGLE_API_KEY') else None)
 genai, GENAI_UNAVAILABLE_REASON = load_genai_module()
+gemini_client = None
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
 GEMINI_VISION_MODEL = os.getenv('GEMINI_VISION_MODEL', GEMINI_MODEL)
 GEMINI_FALLBACK_MODELS = [
@@ -160,7 +158,7 @@ GEMINI_FALLBACK_MODELS = [
 if GEMINI_API_KEY:
     GEMINI_API_KEY = GEMINI_API_KEY.strip().strip('"').strip("'")
     if genai:
-        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         logger.info("✅ Gemini AI configured successfully with model: %s", GEMINI_MODEL)
     else:
         logger.warning("⚠️ Gemini AI disabled: %s", GENAI_UNAVAILABLE_REASON)
@@ -171,7 +169,7 @@ else:
 def gemini_ready():
     if not GEMINI_API_KEY:
         return False, 'Gemini API key not configured'
-    if not genai:
+    if not genai or not gemini_client:
         return False, GENAI_UNAVAILABLE_REASON
     return True, None
 
@@ -205,8 +203,7 @@ def run_gemini_prompt(prompt, preferred_model=None):
     last_error = None
     for model_name in candidates:
         try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
+            response = gemini_client.models.generate_content(model=model_name, contents=prompt)
             return (response.text or '').strip(), None, model_name
         except Exception as exc:
             last_error = str(exc)
@@ -215,6 +212,11 @@ def run_gemini_prompt(prompt, preferred_model=None):
                 break
 
     return None, last_error or 'Gemini request failed', None
+
+
+def run_gemini_contents(contents, preferred_model=None):
+    """Run Gemini for multimodal/string contents with fallback model selection."""
+    return run_gemini_prompt(contents, preferred_model=preferred_model)
 
 # JWT Configuration
 JWT_SECRET = os.getenv('JWT_SECRET', 'your-secret-key-change-in-production')
@@ -301,7 +303,6 @@ def validate_answer_with_gemini(question, answer, max_marks):
         if not ready:
             return None, None, reason
         
-        model = genai.GenerativeModel(GEMINI_MODEL)
         
         prompt = f"""
         As an expert examiner, evaluate the following answer:
@@ -319,8 +320,10 @@ def validate_answer_with_gemini(question, answer, max_marks):
         Format the response clearly.
         """
         
-        response = model.generate_content(prompt)
-        return response.text, None
+        response_text, error, _used_model = run_gemini_prompt(prompt)
+        if error:
+            return None, error
+        return response_text, None
         
     except Exception as e:
         logger.error(f"Gemini AI validation error: {str(e)}")
@@ -373,12 +376,13 @@ def extract_text_from_file(file_content, file_type):
             if not ready:
                 return reason
             
-            model = genai.GenerativeModel(GEMINI_VISION_MODEL)
             image = Image.open(io.BytesIO(file_content))
             
             prompt = "Extract all text from this image. If it's handwritten, transcribe it as accurately as possible."
-            response = model.generate_content([prompt, image])
-            return response.text
+            response_text, error, _used_model = run_gemini_contents([prompt, image], preferred_model=GEMINI_VISION_MODEL)
+            if error:
+                return f"Error extracting text: {error}"
+            return response_text
             
         else:
             return "Unsupported file format"
@@ -558,8 +562,6 @@ def validate_answers(current_user):
             # Process with Gemini AI
             ready, _reason = gemini_ready()
             if ready:
-                model = genai.GenerativeModel(GEMINI_MODEL)
-                
                 prompt = f"""
                 You are an expert examiner. Evaluate this answer sheet:
                 
@@ -576,8 +578,8 @@ def validate_answers(current_user):
                 """
                 
                 try:
-                    response = model.generate_content(prompt)
-                    ai_feedback = response.text
+                    response_text, error, _used_model = run_gemini_prompt(prompt)
+                    ai_feedback = response_text if not error else f"AI evaluation failed: {error}"
                 except Exception as ai_error:
                     ai_feedback = f"AI evaluation failed: {str(ai_error)}"
             else:
@@ -640,8 +642,6 @@ def get_ai_sample_questions(current_user):
                 ]
             }), 200
 
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        
         prompt = f"""
         Generate exactly {count} high-quality questions for {subject} on the topic of {topic}.
         
@@ -655,11 +655,13 @@ def get_ai_sample_questions(current_user):
         Return plain text with one question block per item.
         """
         
-        response = model.generate_content(prompt)
-        
+        response_text, error, _used_model = run_gemini_prompt(prompt)
+        if error:
+            return jsonify({'message': error}), 503
+
         return jsonify({
             'message': 'Sample questions generated successfully',
-            'questions': [q.strip() for q in re.split(r'\n\s*\n', response.text or '') if q.strip()],
+            'questions': [q.strip() for q in re.split(r'\n\s*\n', response_text or '') if q.strip()],
             'ai_generated': True
         }), 200
         
@@ -703,15 +705,16 @@ def generate_dynamic_questions(current_user):
         - expected_answer
         """
 
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        response = model.generate_content(prompt)
+        response_text, error, used_model = run_gemini_prompt(prompt)
+        if error:
+            return jsonify({'message': error}), 503
 
         return jsonify({
             'message': 'Dynamic questions generated successfully',
             'subject': subject,
             'topics': topics,
-            'questions': (response.text or '').strip(),
-            'model': GEMINI_MODEL,
+            'questions': (response_text or '').strip(),
+            'model': used_model or GEMINI_MODEL,
             'count': count,
         }), 200
     except Exception as e:
@@ -772,7 +775,6 @@ def api_generate_material(current_user):
         ready, _reason = gemini_ready()
         if ready:
             try:
-                model = genai.GenerativeModel(GEMINI_MODEL)
                 prompt = f"""
                 You are an expert assistant. Summarize the following text into a {summary_length} summary (brief paragraph(s)) and provide {notes_count} concise bullet points.
 
@@ -787,8 +789,10 @@ def api_generate_material(current_user):
 
                 Return the summary followed by the bullet points.
                 """
-                resp = model.generate_content(prompt)
-                resp_text = resp.text.strip()
+                resp_text, error, _used_model = run_gemini_prompt(prompt)
+                if error:
+                    raise RuntimeError(error)
+                resp_text = (resp_text or '').strip()
                 # Attempt to split into summary and notes
                 parts = resp_text.split('\n\n')
                 summary = parts[0] if parts else resp_text
