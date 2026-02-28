@@ -264,25 +264,62 @@ def token_required(f):
     return decorated
 
 # Gemini AI Helper Functions
-def generate_questions_with_gemini(subject, topics, difficulty, question_types, total_marks):
-    """Generate questions using Gemini AI"""
+def _extract_json_object(raw_text):
+    """Extract a JSON object from plain/fenced model output."""
+    if not raw_text:
+        return None
+
+    text = raw_text.strip()
+    if text.startswith('```'):
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r'\{[\s\S]*\}', text)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
+
+def generate_questions_with_gemini(subject, topics, difficulty, question_types, total_marks, source_material):
+    """Generate source-grounded questions using Gemini AI."""
     try:
         prompt = f"""
-        Generate a question paper for {subject} with the following specifications:
-        
-        Subject: {subject}
-        Topics: {topics}
-        Difficulty Level: {difficulty}
-        Question Types Required: {', '.join(question_types)}
-        Total Marks: {total_marks}
-        
-        Please generate a comprehensive question paper with:
-        1. Clear instructions
-        2. Questions distributed by marks
-        3. Questions covering different topics
-        4. Variety as per question types
-        
-        Format the output with section headers and mark allocations.
+        You are creating a question paper using ONLY user-provided source material.
+        Do NOT use outside knowledge, assumptions, or pre-trained facts.
+        Every question and expected answer must be directly supported by the source.
+
+        If requested topics/instructions include anything not present in the source,
+        return JSON with status "missing_information" and list the missing topics.
+
+        Return ONLY valid JSON in one of these formats:
+        1) Missing info:
+        {{
+          "status": "missing_information",
+          "message": "Information missing in source material.",
+          "missing_topics": ["topic 1", "topic 2"]
+        }}
+
+        2) Success:
+        {{
+          "status": "ok",
+          "content": "formatted question paper text"
+        }}
+
+        Request:
+        - Subject: {subject}
+        - Topics: {topics}
+        - Difficulty Level: {difficulty}
+        - Question Types Required: {', '.join(question_types)}
+        - Total Marks: {total_marks}
+
+        Source Material:
+        {source_material}
         """
         
         response_text, error, used_model = run_gemini_prompt(prompt)
@@ -290,7 +327,26 @@ def generate_questions_with_gemini(subject, topics, difficulty, question_types, 
             return None, error
         if used_model and used_model != GEMINI_MODEL:
             logger.info('Using fallback Gemini model for question paper generation: %s', used_model)
-        return response_text, None
+
+        parsed = _extract_json_object(response_text)
+        if not isinstance(parsed, dict):
+            return None, 'Gemini returned invalid format for source-grounded generation'
+
+        if parsed.get('status') == 'missing_information':
+            missing_topics = parsed.get('missing_topics')
+            if not isinstance(missing_topics, list):
+                missing_topics = []
+            return {
+                'status': 'missing_information',
+                'message': parsed.get('message') or 'Information missing in source material.',
+                'missing_topics': [str(item).strip() for item in missing_topics if str(item).strip()],
+            }, None
+
+        content = (parsed.get('content') or '').strip()
+        if not content:
+            return None, 'Gemini returned empty source-grounded question content'
+
+        return {'status': 'ok', 'content': content}, None
         
     except Exception as e:
         logger.error(f"Gemini AI error: {str(e)}")
@@ -467,20 +523,39 @@ def generate_paper(current_user):
         if context_file and context_file.filename:
             context_text = extract_text_from_file(context_file.read(), context_file.mimetype)
 
+        source_text_input = str(data.get('source_text', '')).strip()
+        source_material = '\n\n'.join([chunk for chunk in [context_text, source_text_input] if chunk]).strip()
+
+        if not source_material:
+            return jsonify({'message': 'Source material is required. Upload a document or provide source_text.'}), 400
+
+        if source_material.startswith('Error') or source_material == 'Unsupported file format':
+            return jsonify({'message': source_material}), 400
+
         additional_info = data.get('additional_info', {})
         if not isinstance(additional_info, dict):
             additional_info = {'raw': str(additional_info)}
-        if context_text:
-            additional_info['context_excerpt'] = context_text[:2500]
+        additional_info['context_excerpt'] = source_material[:2500]
         
         # Generate questions using Gemini AI
-        ai_content, error = generate_questions_with_gemini(
+        ai_result, error = generate_questions_with_gemini(
             data['subject'],
             data['topics'],
             data['difficulty'],
             question_types,
-            total_marks
+            total_marks,
+            source_material
         )
+
+        ai_content = ai_result.get('content') if isinstance(ai_result, dict) else None
+
+        if not error and isinstance(ai_result, dict) and ai_result.get('status') == 'missing_information':
+            return jsonify({
+                'message': ai_result.get('message') or 'Information missing in source material.',
+                'missing_topics': ai_result.get('missing_topics', []),
+                'used_context': bool(source_material),
+                'ai_used': True
+            }), 422
         
         if error:
             # Fallback to template if AI fails
