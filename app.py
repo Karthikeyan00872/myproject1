@@ -145,9 +145,11 @@ def init_database():
 client, db, users_collection, papers_collection, validations_collection = init_database()
 
 # Gemini AI Configuration
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
+GEMINI_API_KEY_SOURCE = 'GEMINI_API_KEY' if os.getenv('GEMINI_API_KEY') else ('GOOGLE_API_KEY' if os.getenv('GOOGLE_API_KEY') else None)
 genai, GENAI_UNAVAILABLE_REASON = load_genai_module()
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
+GEMINI_VISION_MODEL = os.getenv('GEMINI_VISION_MODEL', GEMINI_MODEL)
 
 if GEMINI_API_KEY:
     if genai:
@@ -157,6 +159,14 @@ if GEMINI_API_KEY:
         logger.warning("⚠️ Gemini AI disabled: %s", GENAI_UNAVAILABLE_REASON)
 else:
     logger.warning("⚠️ GEMINI_API_KEY not found. AI features will be limited.")
+
+
+def gemini_ready():
+    if not GEMINI_API_KEY:
+        return False, 'Gemini API key not configured'
+    if not genai:
+        return False, GENAI_UNAVAILABLE_REASON
+    return True, None
 
 # JWT Configuration
 JWT_SECRET = os.getenv('JWT_SECRET', 'your-secret-key-change-in-production')
@@ -207,11 +217,9 @@ def token_required(f):
 def generate_questions_with_gemini(subject, topics, difficulty, question_types, total_marks):
     """Generate questions using Gemini AI"""
     try:
-        if not GEMINI_API_KEY:
-            return None, "Gemini API key not configured"
-
-        if not genai:
-            return None, GENAI_UNAVAILABLE_REASON
+        ready, reason = gemini_ready()
+        if not ready:
+            return None, reason
         
         model = genai.GenerativeModel(GEMINI_MODEL)
         
@@ -243,11 +251,9 @@ def generate_questions_with_gemini(subject, topics, difficulty, question_types, 
 def validate_answer_with_gemini(question, answer, max_marks):
     """Validate answers using Gemini AI"""
     try:
-        if not GEMINI_API_KEY:
-            return None, None, "Gemini API key not configured"
-
-        if not genai:
-            return None, None, GENAI_UNAVAILABLE_REASON
+        ready, reason = gemini_ready()
+        if not ready:
+            return None, None, reason
         
         model = genai.GenerativeModel(GEMINI_MODEL)
         
@@ -317,13 +323,11 @@ def extract_text_from_file(file_content, file_type):
             
         elif file_type in ['image/jpeg', 'image/png', 'image/jpg']:
             # Extract text from image using Gemini Vision
-            if not GEMINI_API_KEY:
-                return "Image processing requires Gemini API key"
-
-            if not genai:
-                return GENAI_UNAVAILABLE_REASON
+            ready, reason = gemini_ready()
+            if not ready:
+                return reason
             
-            model = genai.GenerativeModel('gemini-pro-vision')
+            model = genai.GenerativeModel(GEMINI_VISION_MODEL)
             image = Image.open(io.BytesIO(file_content))
             
             prompt = "Extract all text from this image. If it's handwritten, transcribe it as accurately as possible."
@@ -506,8 +510,9 @@ def validate_answers(current_user):
             extracted_text = extract_text_from_file(file_content, file_type)
             
             # Process with Gemini AI
-            if GEMINI_API_KEY:
-                model = genai.GenerativeModel('gemini-pro')
+            ready, _reason = gemini_ready()
+            if ready:
+                model = genai.GenerativeModel(GEMINI_MODEL)
                 
                 prompt = f"""
                 You are an expert examiner. Evaluate this answer sheet:
@@ -579,15 +584,16 @@ def get_ai_sample_questions(current_user):
         count = max(1, min(int(data.get('count', 5)), 20))
         question_types = normalize_question_types(data.get('question_types', 'MCQ,Short Answer,Essay'))
         
-        if not GEMINI_API_KEY:
+        ready, reason = gemini_ready()
+        if not ready:
             return jsonify({
-                'message': 'Gemini AI not configured',
+                'message': reason,
                 'questions': [
                     f"Sample question {i+1} about {topic} in {subject}"
                     for i in range(count)
                 ]
             }), 200
-        
+
         model = genai.GenerativeModel(GEMINI_MODEL)
         
         prompt = f"""
@@ -632,11 +638,9 @@ def generate_dynamic_questions(current_user):
         if not subject or not topics:
             return jsonify({'message': 'subject and topics are required'}), 400
 
-        if not GEMINI_API_KEY:
-            return jsonify({'message': 'Gemini API key not configured'}), 503
-
-        if not genai:
-            return jsonify({'message': GENAI_UNAVAILABLE_REASON}), 503
+        ready, reason = gemini_ready()
+        if not ready:
+            return jsonify({'message': reason}), 503
 
         prompt = f"""
         You are an assessment design expert.
@@ -673,13 +677,15 @@ def generate_dynamic_questions(current_user):
 def ai_status():
     return jsonify({
         'gemini_configured': bool(GEMINI_API_KEY),
+        'gemini_ready': gemini_ready()[0],
+        'api_key_source': GEMINI_API_KEY_SOURCE,
         'model': GEMINI_MODEL,
         'unavailable_reason': GENAI_UNAVAILABLE_REASON,
         'ai_features': {
-            'question_generation': bool(GEMINI_API_KEY),
-            'answer_validation': bool(GEMINI_API_KEY),
-            'text_extraction': bool(GEMINI_API_KEY),
-            'image_processing': bool(GEMINI_API_KEY)
+            'question_generation': gemini_ready()[0],
+            'answer_validation': gemini_ready()[0],
+            'text_extraction': gemini_ready()[0],
+            'image_processing': gemini_ready()[0]
         }
     }), 200
 
@@ -717,9 +723,10 @@ def api_generate_material(current_user):
                 return jsonify({'success': False, 'message': 'Could not extract text from file.'}), 400
 
         # If Gemini configured, use it for better summarization
-        if GEMINI_API_KEY:
+        ready, _reason = gemini_ready()
+        if ready:
             try:
-                model = genai.GenerativeModel('gemini-pro')
+                model = genai.GenerativeModel(GEMINI_MODEL)
                 prompt = f"""
                 You are an expert assistant. Summarize the following text into a {summary_length} summary (brief paragraph(s)) and provide {notes_count} concise bullet points.
 
