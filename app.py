@@ -286,7 +286,7 @@ def _extract_json_object(raw_text):
             return None
 
 
-def generate_questions_with_gemini(subject, topics, difficulty, question_types, total_marks, source_material):
+def generate_questions_with_gemini(subject, topics, difficulty, question_types, total_marks, source_material, instructions=''):
     """Generate source-grounded questions using Gemini AI."""
     try:
         prompt = f"""
@@ -317,6 +317,7 @@ def generate_questions_with_gemini(subject, topics, difficulty, question_types, 
         - Difficulty Level: {difficulty}
         - Question Types Required: {', '.join(question_types)}
         - Total Marks: {total_marks}
+        - User Instructions: {instructions or 'None'}
 
         Source Material:
         {source_material}
@@ -408,6 +409,28 @@ def parse_request_payload():
         except json.JSONDecodeError:
             data['additional_info'] = {'raw': data['additional_info']}
     return data
+
+
+def get_first_value(data, keys, default=None):
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ''):
+            return value
+    return default
+
+
+def normalize_generate_paper_payload(raw_data):
+    """Accept alternate key names and apply safe defaults for paper generation."""
+    payload = dict(raw_data or {})
+    payload['title'] = str(get_first_value(payload, ['title', 'paper_title', 'paperTitle'], 'Generated Question Paper')).strip()
+    payload['subject'] = str(get_first_value(payload, ['subject', 'paper_subject', 'paperSubject'], 'General')).strip()
+    payload['topics'] = str(get_first_value(payload, ['topics', 'topic', 'paper_topics', 'paperTopics'], 'Document-based questions')).strip()
+    payload['difficulty'] = str(get_first_value(payload, ['difficulty', 'difficulty_level', 'difficultyLevel'], 'medium')).strip()
+    payload['total_marks'] = get_first_value(payload, ['total_marks', 'totalMarks', 'marks'], 100)
+    payload['question_types'] = get_first_value(payload, ['question_types', 'questionTypes', 'question_type', 'questionType'], payload.get('question_types'))
+    payload['instructions'] = str(get_first_value(payload, ['instructions', 'additional_instructions', 'additionalInstructions'], '')).strip()
+    payload['source_text'] = str(get_first_value(payload, ['source_text', 'sourceMaterial', 'source_material', 'content'], '')).strip()
+    return payload
 
 def extract_text_from_file(file_content, file_type, filename=''):
     """Extract text from uploaded files for processing"""
@@ -520,16 +543,11 @@ def serve_script():
 @token_required
 def generate_paper(current_user):
     try:
-        data = parse_request_payload()
-        
-        required_fields = ['title', 'subject', 'topics', 'difficulty', 'question_types', 'total_marks']
-        for field in required_fields:
-            if field not in data or data.get(field) in (None, ''):
-                return jsonify({'message': f'{field} is required'}), 400
+        data = normalize_generate_paper_payload(parse_request_payload())
 
         question_types = normalize_question_types(data.get('question_types', []))
         if not question_types:
-            return jsonify({'message': 'question_types must include at least one type'}), 400
+            question_types = ['Short Answer', 'Long Answer']
 
         total_marks = int(data.get('total_marks', 0))
         if total_marks <= 0:
@@ -540,6 +558,10 @@ def generate_paper(current_user):
             request.files.get('context_file')
             or request.files.get('source_file')
             or request.files.get('source_upload')
+            or request.files.get('file')
+            or request.files.get('document')
+            or request.files.get('pdf')
+            or request.files.get('upload')
         )
         if context_file and context_file.filename:
             context_text = extract_text_from_file(
@@ -560,6 +582,8 @@ def generate_paper(current_user):
         additional_info = data.get('additional_info', {})
         if not isinstance(additional_info, dict):
             additional_info = {'raw': str(additional_info)}
+        if data.get('instructions') and 'instructions' not in additional_info:
+            additional_info['instructions'] = data.get('instructions')
         additional_info['context_excerpt'] = source_material[:2500]
         
         # Generate questions using Gemini AI
@@ -569,7 +593,8 @@ def generate_paper(current_user):
             data['difficulty'],
             question_types,
             total_marks,
-            source_material
+            source_material,
+            data.get('instructions', ''),
         )
 
         ai_content = ai_result.get('content') if isinstance(ai_result, dict) else None
