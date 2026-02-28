@@ -150,8 +150,15 @@ GEMINI_API_KEY_SOURCE = 'GEMINI_API_KEY' if os.getenv('GEMINI_API_KEY') else ('G
 genai, GENAI_UNAVAILABLE_REASON = load_genai_module()
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
 GEMINI_VISION_MODEL = os.getenv('GEMINI_VISION_MODEL', GEMINI_MODEL)
+GEMINI_FALLBACK_MODELS = [
+    'gemini-1.5-flash',
+    'gemini-1.5-flash-8b',
+    'gemini-1.5-pro',
+    'gemini-1.0-pro',
+]
 
 if GEMINI_API_KEY:
+    GEMINI_API_KEY = GEMINI_API_KEY.strip().strip('"').strip("'")
     if genai:
         genai.configure(api_key=GEMINI_API_KEY)
         logger.info("✅ Gemini AI configured successfully with model: %s", GEMINI_MODEL)
@@ -167,6 +174,47 @@ def gemini_ready():
     if not genai:
         return False, GENAI_UNAVAILABLE_REASON
     return True, None
+
+
+def _should_try_another_model(error_message):
+    lowered = (error_message or '').lower()
+    return any(
+        marker in lowered
+        for marker in (
+            'model',
+            'not found',
+            'unsupported',
+            'permission denied',
+            'is not supported',
+            'is not found for api version',
+        )
+    )
+
+
+def run_gemini_prompt(prompt, preferred_model=None):
+    """Run a Gemini prompt and gracefully fallback across free-tier friendly models."""
+    ready, reason = gemini_ready()
+    if not ready:
+        return None, reason, None
+
+    candidates = []
+    for model_name in [preferred_model or GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]:
+        if model_name and model_name not in candidates:
+            candidates.append(model_name)
+
+    last_error = None
+    for model_name in candidates:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            return (response.text or '').strip(), None, model_name
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning('Gemini generation failed for model %s: %s', model_name, last_error)
+            if not _should_try_another_model(last_error):
+                break
+
+    return None, last_error or 'Gemini request failed', None
 
 # JWT Configuration
 JWT_SECRET = os.getenv('JWT_SECRET', 'your-secret-key-change-in-production')
@@ -217,12 +265,6 @@ def token_required(f):
 def generate_questions_with_gemini(subject, topics, difficulty, question_types, total_marks):
     """Generate questions using Gemini AI"""
     try:
-        ready, reason = gemini_ready()
-        if not ready:
-            return None, reason
-        
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        
         prompt = f"""
         Generate a question paper for {subject} with the following specifications:
         
@@ -241,8 +283,12 @@ def generate_questions_with_gemini(subject, topics, difficulty, question_types, 
         Format the output with section headers and mark allocations.
         """
         
-        response = model.generate_content(prompt)
-        return (response.text or '').strip(), None
+        response_text, error, used_model = run_gemini_prompt(prompt)
+        if error:
+            return None, error
+        if used_model and used_model != GEMINI_MODEL:
+            logger.info('Using fallback Gemini model for question paper generation: %s', used_model)
+        return response_text, None
         
     except Exception as e:
         logger.error(f"Gemini AI error: {str(e)}")
