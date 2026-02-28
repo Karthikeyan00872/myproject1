@@ -35,10 +35,12 @@ cp .env.example .env
 Set at least:
 
 - `JWT_SECRET`
-- `GEMINI_API_KEY`
+- `GEMINI_API_KEY` (or `GOOGLE_API_KEY` when using a Google AI Studio key)
+
+Gemini note:
+- If your configured `GEMINI_MODEL` is unavailable for your free-tier account, the backend automatically retries with compatible fallback models.
 
 Mongo options:
-
 - Use local MongoDB via `MONGO_URI`
 - Or keep `MONGO_FALLBACK_TO_MOCK=true` for local in-memory DB fallback (no extra packages required)
 
