@@ -831,6 +831,7 @@ async function generatePaperPreview() {
             formData.append('topics', topics);
             formData.append('difficulty', difficulty);
             formData.append('total_marks', marks);
+            formData.append('instructions', instructions);
 
             // Append question types
             questionTypes.forEach(qt => formData.append('question_types', qt));

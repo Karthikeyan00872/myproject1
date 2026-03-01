@@ -608,7 +608,16 @@ def generate_paper(current_user):
             }), 422
         
         if error:
-            # Fallback to template if AI fails
+            # When source material is provided, do not silently fallback to template questions.
+            # The user explicitly expects AI-generated, source-grounded output.
+            if source_material:
+                return jsonify({
+                    'message': f'AI question generation failed: {error}',
+                    'ai_used': False,
+                    'used_context': bool(context_text),
+                }), 503
+
+            # Fallback to template only when no source material is provided.
             ai_content = f"""
             Question Paper: {data['title']}
             Subject: {data['subject']}
